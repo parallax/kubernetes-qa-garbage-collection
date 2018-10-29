@@ -8,5 +8,6 @@ if (!$loader = include __DIR__ . '/../vendor/autoload.php') {
 $app = new \Cilex\Application('Kubernetes Garbage Collection');
 $app->command(new \Cilex\Command\CollectGarbage());
 $app->command(new \Cilex\Command\CollectGarbageCertificates());
+$app->command(new \Cilex\Command\CheckEvictions());
 
 $app->run();

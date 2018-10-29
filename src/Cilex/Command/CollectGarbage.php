@@ -117,7 +117,7 @@ class CollectGarbage extends Command
         // $qaNamespaces now contains a list of namespaces (by name) and $qaNamespacesCount contains a count of how many there are in total
 
         // Initialise the progress bar
-        $progress = new ProgressBar($output, $qaNamespaceCount * 5);
+        $progress = new ProgressBar($output, $qaNamespaceCount);
         $progress->setProgressCharacter("\xf0\x9f\x94\x8e");
         $progress->setFormatDefinition('custom', '%current%/%max% [%bar%] : %message%');
         $progress->setFormat('custom');
@@ -147,6 +147,7 @@ class CollectGarbage extends Command
             // If this namespace contains replicasets, store some information about them so we can add them to the delete stack if necessary:
             if ($replicaSetCount > 0) {
                 foreach ($replicaSets->items as $replicaSetKey => $replicaSet) {
+
 
                     $name = '';
                     $owner = '';
@@ -181,9 +182,6 @@ class CollectGarbage extends Command
                 }
             }
 
-            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' items to be removed after scanning deployments');
-            $progress->advance();
-
             // Cron
             unset($json);
             $command = 'kubectl get cronjobs --namespace=' . $namespace . ' --kubeconfig=' . $kubeconfig . ' -o json';
@@ -217,9 +215,6 @@ class CollectGarbage extends Command
                 }
             }
 
-            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' items to be removed after scanning cronjobs');
-            $progress->advance();
-
             // Horizontal Pod Autoscalers
             unset($json);
             $command = 'kubectl get hpa --namespace=' . $namespace . ' --kubeconfig=' . $kubeconfig . ' -o json';
@@ -250,8 +245,44 @@ class CollectGarbage extends Command
                 }
             }
 
-            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' items to be removed after scanning horizontal pod autoscalers');
-            $progress->advance();
+            // Memcached/Redis
+            unset($json);
+            $command = 'kubectl get statefulsets --namespace=' . $namespace . ' --kubeconfig=' . $kubeconfig . ' -o json';
+            exec($command, $json, $commandStatus);
+            if ($commandStatus != 0) {
+                throw new \RuntimeException('Kubectl command `' . $command . '` has failed');
+            }
+
+            $json = implode("\n", $json);
+            $statefulsets = json_decode($json);
+            $statefulsetCount = count($statefulsets->items);
+
+            // Calculate whether this namespace contains any deployments - only continue if it doesn't contain any deployments
+            unset($json);
+            $command = 'kubectl get deployments --namespace=' . $namespace . ' --kubeconfig=' . $kubeconfig . ' -o json';
+            exec($command, $json, $commandStatus);
+            if ($commandStatus != 0) {
+                throw new \RuntimeException('Kubectl command `' . $command . '` has failed');
+            }
+
+            $json = implode("\n", $json);
+            $deployments = json_decode($json);
+            $deploymentCount = count($deployments->items);
+
+            if ($statefulsetCount > 0 && $deploymentCount == 0) {
+                foreach ($statefulsets->items as $statefulsetKey => $statefulset) {
+                    // Check that this is redis/memcached
+                    if ($statefulset->metadata->name == 'memcached' || $statefulset->metadata->name == 'redis') {
+                        array_push($toBeDeleted, array(
+                            'namespace' => $statefulset->metadata->namespace,
+                            'name' => $statefulset->metadata->name,
+                            'creationTimestampHuman' => date("H:i d/m/Y", strtotime($statefulset->metadata->creationTimestamp)),
+                            'kind' => 'Stateful Set'
+                        ));
+                        $toBeDeletedCount ++;
+                    }    
+                }
+            }
 
             // Services
             unset($json);
@@ -303,73 +334,7 @@ class CollectGarbage extends Command
                 }
             }
 
-            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' items to be removed after scanning services');
-            $progress->advance();
-
-            // Ingresses
-            unset($json);
-            $command = 'kubectl get ingress --namespace=' . $namespace . ' --kubeconfig=' . $kubeconfig . ' -o json';
-            exec($command, $json, $commandStatus);
-            if ($commandStatus != 0) {
-                throw new \RuntimeException('Kubectl command `' . $command . '` has failed');
-            }
-
-            $json = implode("\n", $json);
-            $ingresses = json_decode($json);
-
-            $ingressCount = count($ingresses->items);
-
-            if ($ingressCount > 0) {
-                foreach ($ingresses->items as $ingressKey => $ingress) {
-
-                    unset($services);
-                    $services = [];
-                    // We have each ingress, now we need to quickly run through and dedupe each service that's referenced in the ingress backend paths to build a list to check against
-                    foreach ($ingress->spec->rules as $ruleKey => $rule) {
-                        foreach ($rule->http->paths as $pathKey => $path) {
-                            if (isset($path->backend->serviceName)) {
-                                array_push($services, $path->backend->serviceName);
-                            }
-                        }
-                    }
-
-                    // Deduplicate the array (likely to actually consist entirely of duplicates)
-                    $services = array_unique($services);
-
-                    // If there are any items in the array:
-                    if (count($services) > 0) {
-
-                        // Set a pointer
-                        $delete = 1;
-
-                        foreach ($services as $serviceKey => $service) {
-                            // Query kubectl for the service to see if it actually exists
-                            $command = 'kubectl get svc --namespace=' . $namespace . ' ' . $service . ' --kubeconfig=' . $kubeconfig . ' -o json 2>1';
-                            exec($command, $json, $commandStatus);
-                            if ($commandStatus != 0) {
-                                // This doesn't actually mean that the command has failed failed - it's failed because there is no such service. If so, continue...
-                            }
-                            else {
-                                // The service exists! Probably best to leave this ingress in-place.
-                                $delete = 0;
-                            }
-                        }
-
-                        // If $delete is still 1, then we can safely say that none of the services referenced actually exist, so it's safe to delete the ingress:
-                        if ($delete === 1) {
-                            array_push($toBeDeleted, array(
-                                'namespace' => $ingress->metadata->namespace,
-                                'name' => $ingress->metadata->name,
-                                'creationTimestampHuman' => date("H:i d/m/Y", strtotime($ingress->metadata->creationTimestamp)),
-                                'kind' => 'Ingress'
-                            ));
-                            $toBeDeletedCount ++;
-                        }
-                    }
-                }
-            }
-
-            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' items to be removed after scanning ingresses');
+            $progress->setMessage('<info>' . $namespace . '</info> found ' . $toBeDeletedCount . ' deployments, cron jobs, hpas, statefulsets and services to be removed');
             $progress->advance();
 
         }
@@ -383,7 +348,7 @@ class CollectGarbage extends Command
 
         if ($toBeDeletedCount > 0)
         {
-            $io->section("Found the following $toBeDeletedCount deployments, ingresses, cron jobs, hpas and services to be removed");
+            $io->section("Found the following $toBeDeletedCount deployments, cron jobs, hpas and services to be removed");
             $table
                 ->setHeaders(array('Namespace', 'Name', 'Created at', 'Kind'))
                 ->setRows($toBeDeleted);
@@ -438,8 +403,8 @@ class CollectGarbage extends Command
                     }
                 }
 
-                if ($deleteRow['kind'] === 'Ingress') {
-                    $command = 'kubectl delete ingress ' . $deleteRow['name'] . ' --namespace=' . $deleteRow['namespace'] . ' --kubeconfig=' . $kubeconfig;
+                if ($deleteRow['kind'] === 'Stateful Set') {
+                    $command = 'kubectl delete statefulset ' . $deleteRow['name'] . ' --namespace=' . $deleteRow['namespace'] . ' --kubeconfig=' . $kubeconfig;
                     exec($command, $json, $commandStatus);
                     if ($commandStatus != 0) {
                         throw new \RuntimeException('Kubectl command `' . $command . '` has failed');
